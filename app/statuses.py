@@ -1,0 +1,41 @@
+"""Processing job / video status constants, shared by the API and worker."""
+
+PENDING = "PENDING"
+FETCHING_METADATA = "FETCHING_METADATA"
+FETCHING_TRANSCRIPT = "FETCHING_TRANSCRIPT"
+DOWNLOADING_AUDIO = "DOWNLOADING_AUDIO"
+TRANSCRIBING = "TRANSCRIBING"
+CHUNKING = "CHUNKING"
+EMBEDDING = "EMBEDDING"
+INDEXING = "INDEXING"
+READY = "READY"
+FAILED = "FAILED"
+
+ORDERED_STEPS = [
+    PENDING,
+    FETCHING_METADATA,
+    FETCHING_TRANSCRIPT,
+    DOWNLOADING_AUDIO,
+    TRANSCRIBING,
+    CHUNKING,
+    EMBEDDING,
+    INDEXING,
+    READY,
+]
+
+TERMINAL_STATUSES = {READY, FAILED}
+
+# Rough progress percentage per step, shown to the caller so they can poll
+# GET /videos/{id} and see something more useful than a bare status string.
+PROGRESS_BY_STATUS = {
+    PENDING: 0,
+    FETCHING_METADATA: 10,
+    FETCHING_TRANSCRIPT: 25,
+    DOWNLOADING_AUDIO: 40,
+    TRANSCRIBING: 55,
+    CHUNKING: 70,
+    EMBEDDING: 85,
+    INDEXING: 95,
+    READY: 100,
+    FAILED: 100,
+}

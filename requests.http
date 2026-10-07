@@ -1,0 +1,75 @@
+@baseUrl = http://localhost:8000
+
+### Health check
+GET {{baseUrl}}/health
+
+### 1. Queue a video for processing (returns immediately — 202).
+# The background worker (`python -m workers.video_processor`) must be
+# running separately to actually pick this job up and process it.
+# Replace with any real YouTube URL (watch, youtu.be, or /shorts also work).
+POST {{baseUrl}}/videos
+Content-Type: application/json
+
+{
+  "youtube_url": "https://www.youtube.com/watch?v=VIDEO_ID_HERE"
+}
+
+### 2. Poll processing status (PENDING -> ... -> READY / FAILED)
+GET {{baseUrl}}/videos/1
+
+### 2b. Retry a failed (or re-run a completed) video's processing
+POST {{baseUrl}}/videos/1/retry
+
+### 3. Get the full stored, timestamped transcript (only once status=READY)
+GET {{baseUrl}}/videos/1/transcript
+
+### 4a. Raw search — hybrid (keyword + fuzzy + semantic), no LLM call
+POST {{baseUrl}}/search
+Content-Type: application/json
+
+{
+  "video_id": 1,
+  "query": "AI replacing programmers",
+  "top_k": 5,
+  "mode": "hybrid"
+}
+
+### 4b. Raw search — exact phrase (quoted), lexical match prioritized
+POST {{baseUrl}}/search
+Content-Type: application/json
+
+{
+  "video_id": 1,
+  "query": "\"OpenAI\"",
+  "top_k": 10,
+  "mode": "hybrid"
+}
+
+### 4c. Raw search — semantic only
+POST {{baseUrl}}/search
+Content-Type: application/json
+
+{
+  "video_id": 1,
+  "query": "OpenAI",
+  "top_k": 10,
+  "mode": "semantic"
+}
+
+### 5. Ask — normal question, grounded answer with real timestamps
+POST {{baseUrl}}/ask
+Content-Type: application/json
+
+{
+  "video_id": 1,
+  "question": "What do they say about AI replacing programmers?"
+}
+
+### 6. Ask — find-all query (every mention, deduplicated, each cited)
+POST {{baseUrl}}/ask
+Content-Type: application/json
+
+{
+  "video_id": 1,
+  "question": "Find every time they mention OpenAI."
+}
