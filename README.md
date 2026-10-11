@@ -1,91 +1,220 @@
-# YouTube AI Search — Backend
+# YouTube AI Search & Chat
 
-A modular FastAPI backend that turns a YouTube URL into a searchable,
-askable, timestamp-accurate transcript: captions or Whisper fallback ->
-semantic chunking -> local embeddings -> pgvector -> hybrid search ->
-grounded LLM answers with citations mapped back to real timestamps.
+Paste a YouTube link, then search the video's dialogue or ask any question about it. Every result and every answer comes with clickable timestamps that jump the embedded player to the exact moment.
 
-Backend/API only — no frontend, no UI.
-
-## Architecture
+Everything runs locally and needs no API keys: embeddings, speech-to-text and the LLM all run on your own machine.
 
 ```
-POST /videos  ──►  creates Video + ProcessingJob (PENDING)  ──►  returns immediately (202)
-                                     │
-                                     ▼
-                     python -m workers.video_processor
-                     (polls processing_jobs for PENDING, one at a time)
-                                     │
-   PENDING → FETCHING_METADATA → FETCHING_TRANSCRIPT
-             → [DOWNLOADING_AUDIO → TRANSCRIBING]   (only if no captions)
-             → CHUNKING → EMBEDDING → INDEXING → READY  (or FAILED)
+YouTube URL ─► captions (or Whisper fallback) ─► sentence-aware chunks ─► local embeddings
+            ─► pgvector ─► hybrid search ─► grounded LLM answer ─► validated timestamps ─► player seeks
 ```
 
-### Modules (`app/`)
+## Features
 
-| Module | Responsibility |
+- **Ask anything about a video.** "What did they say about Elon Musk?", "Find every time they discuss startups."
+- **Search by quote.** Type part of a dialogue line and get its timestamp.
+- **Exact-moment timestamps.** With Whisper transcripts, results point at the phrase itself (23:41), not the start of a 45-second chunk.
+- **Grounded answers.** The LLM only sees retrieved transcript excerpts, and every citation is checked against what was actually retrieved.
+- **Captions first, Whisper fallback.** Uses YouTube captions when they exist and transcribes the audio locally when they don't.
+- **Live processing status.** A progress bar follows the job through every pipeline step, with a Retry button on failure.
+
+## Tech stack
+
+| Layer | Technology |
 |---|---|
-| `youtube.py` | Parse any YouTube URL (watch/youtu.be/shorts/embed/live) → video ID. Fetch title/channel/thumbnail/duration via `yt-dlp`. Fetch official captions via `youtube-transcript-api`; if unavailable, download audio and transcribe with `faster-whisper`, requesting **word-level timestamps**. |
-| `chunking.py` | Merge fine-grained caption/Whisper lines into ~300–700 char / 20–45s semantic chunks, breaking near sentence boundaries, while preserving each chunk's timestamps and concatenated word-timing data. |
-| `timestamps.py` | Single source of truth for timestamp formatting (`MM:SS` / `HH:MM:SS`), text normalization, and **exact phrase localization** — finds the precise start/end of a phrase inside word-level timing data (exact token match, with a fuzzy fallback for ASR noise), not just the chunk it's in. |
-| `embeddings.py` | Local `sentence-transformers` embeddings, generated in batches (`EMBEDDING_BATCH_SIZE`). Free, no API key. |
-| `db.py` | SQLAlchemy models: `Video`, `TranscriptSegment` (with `word_timings` JSON + `pgvector` embedding column), `ProcessingJob`. |
-| `search.py` | `text_search` (ILIKE + trigram ranking), `trigram_search` (fuzzy lexical via `pg_trgm`), `semantic_search` (pgvector cosine similarity), `hybrid_search` (merges all three, de-duped; exact-phrase/quoted queries prioritize lexical matches), `find_all_occurrences` (wide retrieval + precise per-occurrence localization + overlap dedup for "every time X is mentioned" queries). |
-| `llm.py` | Calls the LLM in **JSON mode**, requesting `{"answer", "citations":[{"timestamp","text","segment_id"}]}`, and validates the shape with Pydantic. |
-| `rag.py` | Retrieves grounding evidence (hybrid or find-all, depending on query intent), calls `llm.py`, then **validates every citation against the segments actually retrieved** — a citation pointing at a `segment_id` we didn't retrieve is dropped, and every surviving citation's timestamp is overwritten with the real stored `start_time`, never trusting whatever the model returned. |
-| `main.py` | FastAPI routes (below). |
-| `statuses.py` | Shared status-string constants for `ProcessingJob`/`Video`. |
-| `workers/video_processor.py` | The background worker (`python -m workers.video_processor`): polls `processing_jobs` for the oldest `PENDING` row (claimed via `SELECT ... FOR UPDATE SKIP LOCKED`, so it's safe to run more than one worker process), and walks it through every pipeline step, persisting status/progress/error at each step. |
+| Frontend | Next.js 14 (App Router), TypeScript, Tailwind CSS, `react-youtube` |
+| API | Python, FastAPI, SQLAlchemy, Pydantic |
+| Database | PostgreSQL 16 with `pgvector` (vectors) and `pg_trgm` (fuzzy text) |
+| Embeddings | `sentence-transformers`, model `all-MiniLM-L6-v2` (384-dim, normalized) |
+| Speech-to-text | `faster-whisper` (word-level timestamps), audio via `yt-dlp` + ffmpeg |
+| Transcripts | `youtube-transcript-api` |
+| LLM | Qwen3 4B served locally by Ollama |
+| Infra | Docker Compose (database), DB-polling background worker |
 
-## API
+## How it works
 
-| Endpoint | Purpose |
-|---|---|
-| `POST /videos` | Validate URL, create/reuse `Video`, enqueue a `ProcessingJob`. Returns **immediately** (202) with `video_id` + `job`. Idempotent: a `READY` video isn't re-queued; an in-flight job isn't duplicated. |
-| `GET /videos/{video_id}` | Video metadata + current status + latest job (status/progress/error). |
-| `GET /videos/{video_id}/transcript` | Full stored transcript, timestamps as `{seconds, formatted}`. |
-| `POST /videos/{video_id}/retry` | Re-queue a `FAILED` (or completed) video for reprocessing. 409 if a job is already in flight. |
-| `POST /search` | Raw retrieval (`semantic` / `text` / `hybrid`), no LLM call — returns `segment_id`, timestamps, text, `score`, `match_type`. |
-| `POST /ask` | Full RAG: retrieves evidence, asks the LLM for a structured JSON answer, validates/maps citations to real timestamps. Handles both normal questions and "find every mention of X" queries. 409 if the video isn't `READY` yet. |
+### 1. Ingestion (background worker)
+
+`POST /videos` validates the URL, creates a `Video` and a `ProcessingJob`, and returns immediately. A separate worker process claims the job (`SELECT ... FOR UPDATE SKIP LOCKED`) and moves it through these steps:
+
+```
+PENDING → FETCHING_METADATA → FETCHING_TRANSCRIPT
+        → [DOWNLOADING_AUDIO → TRANSCRIBING]      only when the video has no captions
+        → CHUNKING → EMBEDDING → INDEXING → READY      (or FAILED)
+```
+
+The frontend polls `GET /videos/{id}` and shows the status and progress of each step.
+
+### 2. Chunking
+
+Caption lines and Whisper segments are short, so they are merged into chunks of about 300–700 characters and 20–45 seconds. Chunks close at sentence boundaries where possible, and each chunk keeps its start/end time and the word-level timings of everything merged into it.
+
+### 3. Retrieval
+
+`/search` and `/ask` use hybrid retrieval:
+
+- **Keyword:** case-insensitive substring match, ranked by trigram similarity. Best for names and exact phrases.
+- **Fuzzy:** `pg_trgm` similarity, used when the keyword pass finds nothing (typos, slightly different wording).
+- **Semantic:** cosine similarity over the MiniLM embeddings stored in pgvector.
+- **Find-all mode:** queries like "every time" or "find all" trigger a wide retrieval that returns each literal occurrence, localized to the word and de-duplicated within a time window.
+- **Quoted queries** (`"open ai"`) put lexical matches ahead of semantic ones.
+
+### 4. Grounded answers
+
+`/ask` retrieves the best excerpts, labels each with its `segment_id` and timestamp, and asks the LLM to answer from those excerpts only and reply as JSON: `{answer, citations: [{segment_id, timestamp, text, quote}]}`.
+
+The response is never trusted blindly:
+
+- JSON is validated with Pydantic (markdown fences and `mm:ss` timestamps are tolerated).
+- Citations pointing at a segment that was not retrieved are dropped.
+- The returned timestamp is replaced by the real stored one. If the model supplied an exact `quote`, it is located inside the chunk's word timings (exact match, then fuzzy fallback for transcription errors) to pinpoint the moment.
+- If the model returns malformed output, the API falls back to showing the top matching segments instead of a made-up answer.
+
+## Project structure
+
+```
+youtube-ai-search-3/
+├── app/
+│   ├── main.py          FastAPI routes
+│   ├── db.py            SQLAlchemy models: Video, TranscriptSegment, ProcessingJob
+│   ├── youtube.py       URL parsing, metadata, captions, Whisper fallback
+│   ├── chunking.py      sentence-aware chunking
+│   ├── embeddings.py    local sentence-transformers embeddings
+│   ├── search.py        keyword / fuzzy / semantic / hybrid / find-all
+│   ├── llm.py           Ollama call + structured-output parsing
+│   ├── rag.py           retrieval + citation validation
+│   ├── timestamps.py    formatting + exact phrase localization
+│   ├── statuses.py      job status constants
+│   ├── schemas.py       request/response models
+│   └── config.py        settings (overridable via .env)
+├── workers/
+│   └── video_processor.py   background worker
+├── tests/               pytest suite
+├── frontend/            Next.js app
+│   └── src/
+│       ├── app/         page + layout
+│       ├── components/  UrlForm, StatusProgress, VideoPlayer, TranscriptPanel, ChatPanel
+│       └── lib/         api.ts (typed client), types.ts (mirrors schemas.py)
+├── docker-compose.yml   Postgres + pgvector
+├── init_db.sql          enables the vector and pg_trgm extensions
+├── requirements.txt
+└── requests.http        sample API calls (VS Code REST Client)
+```
+
+## Prerequisites
+
+- Python 3.10+ (developed on 3.13)
+- Node.js 18+
+- Docker Desktop (for the database)
+- [Ollama](https://ollama.com)
+- ffmpeg on your PATH (only needed for the Whisper fallback; macOS: `brew install ffmpeg`)
 
 ## Setup
 
+Run everything from the project root (`youtube-ai-search-3/`) unless noted.
+
+**1. Database**
+
 ```bash
-docker compose up -d                      # Postgres + pgvector + pg_trgm
-pip install -r requirements.txt           # requires ffmpeg on PATH for Whisper fallback
-cp .env.example .env                      # then set OPENAI_API_KEY
-uvicorn app.main:app --reload             # API on :8000
-python -m workers.video_processor         # run in a second terminal — does the actual work
+docker compose up -d db
+docker compose exec db psql -U postgres -d youtube_ai_search -c "\dx"   # should list vector and pg_trgm
 ```
 
-Then open `requests.http` in VS Code (REST Client extension) and step
-through: queue a video, poll its status until `READY`, then hit `/search`
-and `/ask`.
+**2. LLM**
 
-## Design notes
+```bash
+ollama pull qwen3:4b
+curl http://127.0.0.1:11434/api/tags      # should list qwen3:4b
+```
 
-- **No message broker.** Per the project's scope this is a simple
-  single-table DB-polling worker, not Celery/Redis — `processing_jobs` rows
-  are claimed with `SELECT ... FOR UPDATE SKIP LOCKED` so multiple worker
-  processes can safely run side by side if you need more throughput.
-- **Timestamp precision is prioritized everywhere.** Whisper is asked for
-  word-level timestamps (`word_timestamps=True`); YouTube captions are
-  line-level only, so phrase lookups on those fall back to chunk-level
-  timestamps (still accurate to the ~20–45s chunk, just not word-precise).
-  `find_all_occurrences` re-localizes every candidate against word timing
-  data when available, rather than trusting the chunk's start time.
-- **Citations are never trusted blindly.** The LLM is asked to cite a
-  `segment_id` it was given in context; `rag.py` looks that segment up in
-  what was actually retrieved and substitutes the *real* stored
-  `start_time`. Any citation referencing a `segment_id` not in the
-  retrieved set is silently dropped rather than surfaced to the user.
-- **Errors are sanitized.** The worker never stores a raw stack trace or a
-  string containing `sk-`/`Bearer ` in `processing_jobs.error`; the API
-  never returns a stack trace to the client (a global `SQLAlchemyError`
-  handler and per-route try/except keep responses generic).
-- **Embedding model unchanged** (`all-MiniLM-L6-v2`, 384-dim) — swapping it
-  would require re-embedding every stored segment and a pgvector column
-  migration, and there's no indication of a quality problem with it.
+If `ollama serve` says the port is already in use, Ollama is already running, which is fine.
+
+**3. Backend dependencies**
+
+```bash
+python -m venv venv
+source venv/bin/activate                  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**4. Allow the frontend to call the API (CORS)**
+
+Add this to `app/main.py`, right after `app = FastAPI(...)`:
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+**5. Frontend dependencies**
+
+```bash
+cd frontend
+npm install
+echo "NEXT_PUBLIC_API_URL=http://localhost:8000" > .env.local
+```
+
+## Run
+
+Open three terminals (Ollama runs in the background on its own).
+
+```bash
+# Terminal 1: API (project root, venv active)
+uvicorn app.main:app --reload --port 8000
+
+# Terminal 2: worker (project root, venv active)
+python -m workers.video_processor
+
+# Terminal 3: frontend
+cd frontend && npm run dev
+```
+
+Open **http://localhost:3000**, paste a YouTube URL, and wait for the status to reach READY. The first run is slower because the embedding model (and the Whisper model, if needed) is downloaded once.
+
+## Configuration
+
+Defaults live in `app/config.py`. Override any of them with a `.env` file in the project root.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/youtube_ai_search` | Postgres connection (matches `docker-compose.yml`) |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `all-MiniLM-L6-v2` / `384` | Changing the model means re-embedding all data and migrating the vector column |
+| `WHISPER_MODEL` | `base` | Larger models are more accurate but slower |
+| `WHISPER_DEVICE` / `WHISPER_COMPUTE_TYPE` | `cpu` / `int8` | Whisper runtime |
+| `CHUNK_MIN_CHARS` / `CHUNK_MAX_CHARS` | `300` / `700` | Chunk size |
+| `CHUNK_MIN_SECONDS` / `CHUNK_MAX_SECONDS` | `20` / `45` | Chunk duration |
+| `DEFAULT_TOP_K` | `5` | Excerpts sent to the LLM for normal questions |
+| `FIND_ALL_TOP_K` | `30` | Candidates for "find every mention" queries |
+| `FIND_ALL_DEDUP_WINDOW_SECONDS` | `8` | Mentions closer than this are merged |
+| `WORKER_POLL_INTERVAL_SECONDS` | `2` | How often the worker checks for jobs |
+
+The Ollama URL and model name (`qwen3:4b`) are constants at the top of `app/llm.py`.
+
+## API
+
+Interactive docs are available at http://localhost:8000/docs.
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /videos` | Queue a video: `{"youtube_url": "..."}`. Returns 202 immediately. A READY video is not re-queued, and an in-flight job is not duplicated. |
+| `GET /videos/{id}` | Metadata, status, and latest job progress/error |
+| `GET /videos/{id}/transcript` | Full transcript with `{seconds, formatted}` timestamps |
+| `POST /videos/{id}/retry` | Re-queue a video (409 if a job is already running) |
+| `POST /search` | Retrieval only, no LLM: `{video_id, query, mode: hybrid\|semantic\|text, top_k}` |
+| `POST /ask` | Grounded answer with citations: `{video_id, question}` (409 until the video is READY) |
+| `GET /health` | Liveness check |
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{"video_id": 1, "question": "What did they say about startups?"}'
+```
 
 ## Tests
 
@@ -93,21 +222,26 @@ and `/ask`.
 pytest tests/ -v
 ```
 
-Covers (all pure-logic, external services mocked/not required): YouTube URL
-parsing across watch/youtu.be/shorts/embed/live formats, timestamp
-formatting (`1421s → "23:41"`, `3725s → "01:02:05"`), text normalization,
-exact + fuzzy phrase localization against word-timing data, chunking
-(size/duration bounds, sentence-boundary splitting, word-timing
-preservation), find-all/exact-phrase query detection, structured LLM JSON
-output parsing/validation, and RAG citation validation (fabricated/
-hallucinated timestamps and segment IDs are proven to be rejected).
+The suite covers URL parsing, timestamp formatting and phrase localization, chunking, query-intent detection, structured LLM output parsing, and citation validation (fabricated timestamps and segment IDs are rejected). External services are not required.
 
-**What was *not* tested end-to-end** (this sandbox has no live Postgres, no
-network access to YouTube/OpenAI, and the heavy ML libraries —
-`sentence-transformers`, `faster-whisper` — were stubbed out for import
-testing rather than installed): the real DB read/write path, real caption
-fetching, real Whisper transcription, and real OpenAI calls. Run the
-commands under Setup locally to exercise those.
-# Video-Question-Answering
-# Video-Question-Answering
-# Video-Question-Answering
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+|---|---|
+| Status stays on **PENDING** | The worker isn't running. Start `python -m workers.video_processor`. |
+| Browser shows CORS errors, requests fail | Step 4 (CORS middleware) is missing, or the frontend origin isn't `http://localhost:3000`. |
+| `role "postgres" does not exist` | Another Postgres (e.g. Homebrew's) is bound to port 5432 and answering instead of the Docker one. Run `brew services stop postgresql@16`, then `docker compose up -d db`. Check with `lsof -iTCP:5432 -sTCP:LISTEN -n -P`. |
+| `Could not connect to Ollama` | Ollama isn't running, or `qwen3:4b` isn't pulled. Run `ollama list`. |
+| Whisper step fails | ffmpeg is missing from your PATH, or `yt-dlp` is outdated and YouTube changed something. Try `pip install -U yt-dlp`. |
+| Video fails immediately | Private, age-restricted, or region-blocked videos can't be fetched. Try a public one. |
+
+## Limitations
+
+- **Timestamp precision depends on the source.** Whisper transcripts give word-level timing. YouTube captions are line-level only, so results from caption-based videos are accurate to the chunk (about 20–45 seconds).
+- **`/ask` is single-turn.** Each question is answered independently, which keeps every answer tied to its own retrieval, but there is no follow-up memory.
+- **Answer quality is bounded by the local model.** Qwen3 4B is small. A larger Ollama model can be dropped in by changing `OLLAMA_MODEL` in `app/llm.py`.
+- **English-first.** Caption selection prefers English, and the default MiniLM embedding model is English-centric.
+
+## Roadmap ideas
+
+Multi-turn chat, a multilingual embedding model, re-ranking, auth and per-user libraries, and a production deployment setup.
